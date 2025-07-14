@@ -7,21 +7,30 @@
 #include "defer.h"
 #include "MClipboard.h"
 #include "CodePageConversion.h"
+#include "MPicture.h"
+#include <algorithm>
+
+const std::wstring Chat::MAIN_TAB_NAME = L"Main";
+
+static std::wstring to_lower_wstring(const std::wstring& str) {
+	std::wstring lower_str = str;
+	std::transform(lower_str.begin(), lower_str.end(), lower_str.begin(),
+		[](wchar_t c) { return std::tolower(c); });
+	return lower_str;
+}
 
 namespace ResizeFlagsType
 {
-enum
-{
-	X1 = 1 << 0,
-	Y1 = 1 << 1,
-	X2 = 1 << 2,
-	Y2 = 1 << 3,
-};
+	enum
+	{
+		X1 = 1 << 0,
+		Y1 = 1 << 1,
+		X2 = 1 << 2,
+		Y2 = 1 << 3,
+	};
 }
 
-// Note that while Wrap and Linebreak both act as linebreaks,
-// the former is placed by the line-wrapping mechanism and
-// the latter is explicitly placed by the message creator.
+
 enum class FormatSpecifierType {
 	Unknown = -1,
 	Wrap,
@@ -33,26 +42,30 @@ enum class FormatSpecifierType {
 	BoldItalic,
 	Underline,
 	Strikethrough,
+	Emoji,
 };
 
 struct FormatSpecifier {
 	int nStartPos;
 	FormatSpecifierType ft;
 	D3DCOLOR Color;
+	std::wstring EmojiName;
 
 	FormatSpecifier(int nStart, D3DCOLOR c) : nStartPos(nStart), ft(FormatSpecifierType::Color), Color(c) { }
 	FormatSpecifier(int nStart, FormatSpecifierType type) : nStartPos(nStart), ft(type) { }
+	FormatSpecifier(int nStart, std::wstring name) : nStartPos(nStart), ft(FormatSpecifierType::Emoji), EmojiName(std::move(name)) { }
 };
 
 
 struct ChatMessage {
 	Chat::TimeType Time{};
-	std::wstring Msg;
+	std::wstring OriginalMsg;
+	std::wstring ProcessedMsg;
 	u32 DefaultColor;
 	std::vector<FormatSpecifier> FormatSpecifiers;
 	int Lines{};
 
-	void SubstituteFormatSpecifiers();
+	void SubstituteFormatSpecifiers(const std::map<std::wstring, MBitmap*>& EmojiMap);
 
 	int GetLines() const {
 		return Lines;
@@ -62,7 +75,7 @@ struct ChatMessage {
 		erase_remove_if(FormatSpecifiers, [&](auto&& x) { return x.ft == FormatSpecifierType::Wrap; });
 	}
 
-	const FormatSpecifier *GetLineBreak(int n) const {
+	const FormatSpecifier* GetLineBreak(int n) const {
 		int i = 0;
 		for (auto it = FormatSpecifiers.begin(); it != FormatSpecifiers.end(); it++) {
 			if (it->ft == FormatSpecifierType::Wrap || it->ft == FormatSpecifierType::Linebreak) {
@@ -76,7 +89,6 @@ struct ChatMessage {
 		return 0;
 	}
 
-	// Returns an iterator to the format specifier that was inserted.
 	auto AddWrappingLineBreak(int n) {
 		assert(n >= 0);
 		if (n < 0)
@@ -84,113 +96,89 @@ struct ChatMessage {
 
 		if (FormatSpecifiers.empty()) {
 			FormatSpecifiers.emplace_back(n, FormatSpecifierType::Wrap);
-			// Return the last iterator, since we appended to the end.
 			return std::prev(FormatSpecifiers.end());
 		}
 
 		for (auto it = FormatSpecifiers.rbegin(); it != FormatSpecifiers.rend(); it++) {
 			if (it->nStartPos < n) {
-				// it.base() is AFTER it (in terms of normal order, not reversed),
-				// and insert inserts BEFORE the passed iterator, so this inserts
-				// after the current iterator, which is correct since the
-				// desired index n is after the current format specifier.
 				return FormatSpecifiers.insert(it.base(), FormatSpecifier(n, FormatSpecifierType::Wrap));
 			}
 		}
 
-		// The loop was unable to find a format specifier that precedes
-		// the position, so we must add it at the start.
 		return FormatSpecifiers.insert(FormatSpecifiers.begin(), FormatSpecifier(n, FormatSpecifierType::Wrap));
 	}
 };
 
 namespace EmphasisType
 {
-enum
-{
-	Default = 0,
-	Italic = 1 << 0,
-	Bold = 1 << 1,
-	Underline = 1 << 2,
-	Strikethrough = 1 << 3,
-};
+	enum
+	{
+		Default = 0,
+		Italic = 1 << 0,
+		Bold = 1 << 1,
+		Underline = 1 << 2,
+		Strikethrough = 1 << 3,
+	};
 }
 
-// A substring of a line to be displayed.
-// The substring may be the entire line, but cannot span more than one line.
+
 struct LineSegmentInfo
 {
-	// Index into Chat::vMsgs.
+	enum class SegmentType { Text, Emoji };
+	SegmentType Type{ SegmentType::Text };
+	MBitmap* pEmojiBitmap{ nullptr };
+
 	int ChatMessageIndex;
-	// Offset into ChatMessage::Msg at which the substring to be displayed begins.
 	u16 Offset;
-	// Length of the substring, in characters.
 	u16 LengthInCharacters;
-	// Pixel offset on the X axis at which this segment starts.
 	u16 PixelOffsetX;
 	struct {
-		// Is this the start of the line?
 		u16 IsStartOfLine : 1;
-		// Emphasis, i.e. italic, bold, etc.
-		// This is a bitmask; it can hold a combination of multiple emphases.
 		u16 Emphasis : 15;
 	};
 	u32 TextColor;
 };
 
-// Stuff crashes if this is increased
 static constexpr int MAX_INPUT_LENGTH = 230;
-
-void ChatMessage::SubstituteFormatSpecifiers()
+void ChatMessage::SubstituteFormatSpecifiers(const std::map<std::wstring, MBitmap*>& EmojiMap)
 {
-	// TODO: Properly handle multiple emphases at once, e.g. both italic and underlined,
-	// and remove only one when one is ended.
-
 	auto CharToFT = [&](char c) {
 		switch (c) {
 		case 'b': return FormatSpecifierType::Bold;
 		case 'i': return FormatSpecifierType::Italic;
 		case 's': return FormatSpecifierType::Strikethrough;
 		case 'u': return FormatSpecifierType::Underline;
-		//case 'n': return FormatSpecifierType::Linebreak;
 		default:  return FormatSpecifierType::Unknown;
 		};
 	};
 
 	const auto npos = std::wstring::npos;
-
 	bool Erased = false;
 
-	for (auto Pos = Msg.find_first_of(L"^[", 0);
-		Pos != npos && Pos <= Msg.length() - 2;
-		Pos = Pos < Msg.length() ? Msg.find_first_of(L"^[", Erased ? Pos : Pos + 1) : npos)
+	for (auto Pos = ProcessedMsg.find_first_of(L"^[", 0);
+		Pos != npos && Pos <= ProcessedMsg.length() - 2;
+		Pos = Pos < ProcessedMsg.length() ? ProcessedMsg.find_first_of(L"^[", Erased ? Pos : Pos + 1) : npos)
 	{
 		Erased = false;
 
 		auto Erase = [&](std::wstring::size_type Count) {
-			Msg.erase(Pos, Count);
-
+			ProcessedMsg.erase(Pos, Count);
 			Erased = true;
 		};
 
-		auto RemainingLength = Msg.length() - Pos;
-		auto CurrentChar = Msg[Pos];
+		if (Pos + 1 >= ProcessedMsg.length()) continue;
+		auto CurrentChar = ProcessedMsg[Pos];
 
 		if (CurrentChar == '^')
 		{
-			// Handles color specifiers, like "Normal text ^1Red text"
-			auto NextChar = Msg[Pos + 1];
+			auto NextChar = ProcessedMsg[Pos + 1];
 			if (isdigit(NextChar))
 			{
-				// Simple specifier, e.g. "^1Red text"
-
 				FormatSpecifiers.emplace_back(Pos, MMColorSet[NextChar - '0']);
 				Erase(2);
 			}
 			else if (NextChar == '#')
 			{
-				// Elaborate specifier, e.g. "^#80FF0000Transparent red text"
-
 				auto ishexdigit = [&](auto c) {
 					c = tolower(c);
 					return isdigit(c) || (c >= 'a' && c <= 'f');
@@ -198,73 +186,116 @@ void ChatMessage::SubstituteFormatSpecifiers()
 
 				auto ColorStart = Pos + 2;
 				auto ColorEnd = ColorStart;
-				while (ColorEnd < Msg.length() &&
-					ColorEnd - ColorStart < 8 &&
-					ishexdigit(Msg[ColorEnd])) {
+				while (ColorEnd < ProcessedMsg.length() && ColorEnd - ColorStart < 8 && ishexdigit(ProcessedMsg[ColorEnd])) {
 					++ColorEnd;
 				}
 
 				auto Distance = ColorEnd - ColorStart;
-
-				// Must be 8 digits
-				if (Distance != 8)
-					continue;
-
-				wchar_t ColorString[32];
-				strncpy_safe(ColorString, &Msg[ColorStart], Distance);
-
-				wchar_t* endptr;
-				auto Color = static_cast<D3DCOLOR>(wcstoul(ColorString, &endptr, 16));
-				assert(endptr == ColorString + Distance);
-
-				FormatSpecifiers.emplace_back(Pos, Color);
-				Erase(ColorEnd - Pos);
+				if (Distance == 8) {
+					wchar_t ColorString[32];
+					strncpy_safe(ColorString, &ProcessedMsg[ColorStart], Distance);
+					wchar_t* endptr;
+					auto Color = static_cast<D3DCOLOR>(wcstoul(ColorString, &endptr, 16));
+					FormatSpecifiers.emplace_back(Pos, Color);
+					Erase(ColorEnd - Pos);
+				}
 			}
 		}
 		else if (CurrentChar == '[')
 		{
-			// Handles specifiers like "Normal text [b]Bold text[/b]"
-			auto EndBracket = Msg.find_first_of(L"]", Pos + 1);
-
-			if (EndBracket == npos)
-				continue; // Malformed specifier
+			auto EndBracket = ProcessedMsg.find_first_of(L"]", Pos + 1);
+			if (EndBracket == npos) continue;
 
 			auto Distance = EndBracket - Pos;
-
-			if (Msg[Pos + 1] == '/' && (Distance == 2 || Distance == 3))
+			if (ProcessedMsg[Pos + 1] == '/' && (Distance == 2 || Distance == 3))
 			{
-				// End of sequence
-				// Matches e.g. [/], [/b], [/i]
-
-				// Go back to default text
 				FormatSpecifiers.emplace_back(Pos, FormatSpecifierType::Default);
 			}
 			else
 			{
-				// Beginning of sequence
-				// Matches e.g. [b], [i]
-				auto ft = CharToFT(Msg[Pos + 1]);
-				if (ft == FormatSpecifierType::Unknown)
-					continue;
-
-				FormatSpecifiers.emplace_back(Pos, ft);
+				auto ft = CharToFT(ProcessedMsg[Pos + 1]);
+				if (ft != FormatSpecifierType::Unknown)
+					FormatSpecifiers.emplace_back(Pos, ft);
 			}
-
 			Erase(Distance + 1);
 		}
 	}
+
+	size_t SearchPos = 0;
+	while ((SearchPos = ProcessedMsg.find(L':', SearchPos)) != npos) {
+		auto EndPos = ProcessedMsg.find(L':', SearchPos + 1);
+		if (EndPos == npos) {
+			break;
+		}
+
+		std::wstring EmojiName = ProcessedMsg.substr(SearchPos + 1, EndPos - (SearchPos + 1));
+		if (!EmojiName.empty() && EmojiMap.count(EmojiName))
+		{
+			if (EndPos == ProcessedMsg.length() - 1)
+			{
+				ProcessedMsg.replace(SearchPos, EndPos - SearchPos + 1, L"\uFFFC ");
+			}
+			else
+			{
+				ProcessedMsg.replace(SearchPos, EndPos - SearchPos + 1, L"\uFFFC");
+			}
+
+			FormatSpecifiers.emplace_back(SearchPos, EmojiName);
+
+			SearchPos++;
+		}
+		else {
+			SearchPos++;
+		}
+	}
 }
+
+void Chat::InitializeEmojis()
+{
+	
+	// Pair format: { "EmojiNameWithoutColons", "emoji_filename.png" }
+	const std::vector<std::pair<const wchar_t*, const char*>> emojiList = {
+		{ L"sweat",   "monkas.png" },
+		{ L"sadge",    "sadge.png" },
+		{ L"yes", "pepyes.png" },
+		{ L"no",   "pepno.png" },
+		{ L"cool",   "cool.png" },
+		{ L"angry",   "angry.png" },
+		{ L"smug",   "smug.png" },
+		{ L"think",   "think.png" },
+		{ L"laugh",   "laugh.png" },
+		{ L"wtf",   "wtf.png" },
+		{ L"lost",   "lost.png" },
+		{ L"wave",   "wave.png" },
+		{ L"imok",   "imok.png" },
+		{ L"finger",   "finger.png" },
+		{ L"giggle",   "giggle.png" },
+		{ L"hm",      "pephm.png" }
+		// --- Add your new emoji spots here ---
+		// { L"newEmojiName", "new_emoji_file.png" },
+		// { L"anotherOne",   "another_one.png" },
+	};
+
+	// Loop through the list and load each emoji
+	for (const auto& emoji : emojiList) {
+		MBitmap* pBitmap = MBitmapManager::Get(emoji.second); // Get bitmap from filename
+		if (pBitmap) {
+			m_EmojiMap[emoji.first] = pBitmap; // Map the emoji name to the bitmap
+		}
+	}
+}
+
 
 Chat::Chat(const std::string& FontName, bool BoldFont, int FontSize)
 	: FontName{ FontName }, BoldFont{ BoldFont }, FontSize{ FontSize }
 {
 	const auto ScreenWidth = RGetScreenWidth();
 	const auto ScreenHeight = RGetScreenHeight();
-
+	m_bLeftButtonDownLastFrame = false;
 	Border.x1 = 10;
-	Border.y1 = double(1080 - 300) / 1080 * ScreenHeight;
-	Border.x2 = (double)500 / 1920 * ScreenWidth;
-	Border.y2 = double(1080 - 100) / 1080 * ScreenHeight;
+	Border.y1 = double(1080 - 280) / 1080 * ScreenHeight;
+	Border.x2 = (double)700 / 1920 * ScreenWidth;
+	Border.y2 = double(1080 - 40) / 1080 * ScreenHeight;
 
 	Cursor.x = ScreenWidth / 2;
 	Cursor.y = ScreenHeight / 2;
@@ -276,22 +307,45 @@ Chat::Chat(const std::string& FontName, bool BoldFont, int FontSize)
 		int(float(FontSize) / 1080 * RGetScreenHeight() + 0.5), Scale, BoldFont, true);
 
 	FontHeight = DefaultFont.GetHeight();
+
+	// --- FIX: Use a normalized key for the main tab ---
+	std::wstring main_key = to_lower_wstring(MAIN_TAB_NAME);
+	m_Tabs[main_key] = ChatTab{};
+	m_Tabs[main_key].Name = MAIN_TAB_NAME; // Keep original case for display
+	m_sActiveTabName = main_key;           // Set active tab to the normalized key
 }
 
 Chat::~Chat() = default;
 
-void Chat::EnableInput(bool Enable, bool ToTeam){
+ChatTab& Chat::GetActiveTab()
+{
+	return m_Tabs.at(m_sActiveTabName);
+}
+
+const ChatTab& Chat::GetActiveTab() const
+{
+	return m_Tabs.at(m_sActiveTabName);
+}
+
+void Chat::EnableInput(bool Enable, bool ToTeam) {
 	InputEnabled = Enable;
 	TeamChat = ToTeam;
 
-	if (Enable){
+	if (Enable) {
+		// Mark all current notifications as acknowledged by the user.
+		for (auto& pair : m_Tabs) {
+			pair.second.bHasBeenAcknowledged = true;
+		}
+
+		m_bNotificationsMuted = false;
+
 		InputField.clear();
 
 		CaretPos = -1;
 
 		SetCursorPos(RGetScreenWidth() / 2, RGetScreenHeight() / 2);
 	}
-	else{
+	else {
 		ZGetInput()->ResetRotation();
 
 		SelectionState = SelectionStateType{};
@@ -302,58 +356,139 @@ void Chat::EnableInput(bool Enable, bool ToTeam){
 	ZPostPeerChatIcon(Enable);
 }
 
-void Chat::OutputChatMsg(const char *Msg){
+void Chat::OutputChatMsg(const char* Msg) {
 	OutputChatMsg(Msg, TextColor);
 }
 
-void Chat::OutputChatMsg(const char *szMsg, u32 dwColor)
+void Chat::OutputChatMsg(const char* szMsg, u32 dwColor)
 {
 	wchar_t WideMsg[4096];
-	auto ret = CodePageConversion<CP_UTF8>(WideMsg, szMsg);
-	if (ret == ConversionError)
+	if (CodePageConversion<CP_UTF8>(WideMsg, szMsg) == ConversionError)
 	{
 		MLog("Chat::OutputChatMsg -- Conversion error\n");
 		assert(false);
 		return;
 	}
 
-	Msgs.emplace_back();
-	auto&& Msg = Msgs.back();
+	std::wstring msg_str(WideMsg);
+	const std::wstring incoming_whisper_prefix = L"Whispering (";
+	const std::wstring outgoing_whisper_prefix = L"(To ";
+
+	std::wstring targetTabKey = to_lower_wstring(MAIN_TAB_NAME);
+	std::wstring displayName = MAIN_TAB_NAME;
+	std::wstring finalMsg = msg_str;
+
+	bool is_incoming = (msg_str.rfind(incoming_whisper_prefix, 0) == 0);
+	bool is_outgoing = (msg_str.rfind(outgoing_whisper_prefix, 0) == 0);
+
+	if (is_incoming || is_outgoing)
+	{
+		size_t name_start = is_incoming ? incoming_whisper_prefix.length() : outgoing_whisper_prefix.length();
+		size_t name_end = msg_str.find(L")", name_start);
+		size_t msg_start = msg_str.find(L": ", name_end);
+
+		if (name_end != std::wstring::npos && msg_start != std::wstring::npos)
+		{
+			// --- NORMALIZATION LOGIC ---
+			// Store the original name for display
+			displayName = msg_str.substr(name_start, name_end - name_start);
+			// Use the lowercase version as the key
+			targetTabKey = to_lower_wstring(displayName);
+			// --- END NORMALIZATION LOGIC ---
+
+			finalMsg = msg_str.substr(msg_start + 2);
+		}
+	}
+
+	// Use the normalized key for all map operations
+	if (m_Tabs.find(targetTabKey) == m_Tabs.end()) {
+		m_Tabs[targetTabKey] = ChatTab{};
+		// Store the original-cased name for display
+		m_Tabs[targetTabKey].Name = displayName;
+	}
+
+	ChatTab& targetTab = m_Tabs[targetTabKey];
+
+	// --- START of CHANGE: Add "You:" and "Them:" prefixes to whispers ---
+
+	if (is_incoming) {
+		finalMsg = L"Them:" + finalMsg;
+	}
+	else if (is_outgoing) {
+		finalMsg = L"You:" + finalMsg;
+	}
+
+	// --- END of CHANGE ---
+
+	targetTab.Messages.emplace_back();
+	auto&& Msg = targetTab.Messages.back();
 	Msg.Time = GetTime();
-	Msg.Msg = WideMsg;
+	Msg.OriginalMsg = finalMsg;
+	Msg.ProcessedMsg = finalMsg;
 	Msg.DefaultColor = dwColor;
 
-	Msg.SubstituteFormatSpecifiers();
-	DivideIntoLines(Msgs.size() - 1, std::back_inserter(LineSegments));
+	targetTab.bLayoutIsDirty = true;
 
-	NumNewlyAddedLines += Msg.GetLines();
-	if (ChatLinesPixelOffsetY <= 0)
-		ChatLinesPixelOffsetY = FontHeight;
+	if (is_incoming && to_lower_wstring(m_sActiveTabName) != targetTabKey) {
+		targetTab.UnreadCount++;
+		targetTab.bHasBeenAcknowledged = false; // This resets the acknowledged status for the new message.
+	}
+
+	if (to_lower_wstring(m_sActiveTabName) == targetTabKey)
+	{
+		if (!targetTab.Messages.empty()) {
+			NumNewlyAddedLines = targetTab.Messages.back().GetLines();
+			if (targetTab.ScrollOffsetLines > 0) {
+				targetTab.ScrollOffsetLines += NumNewlyAddedLines;
+			}
+			if (ChatLinesPixelOffsetY <= 0) {
+				ChatLinesPixelOffsetY = FontHeight;
+			}
+		}
+	}
+	m_LastMessageTime = GetTime();
 }
 
-void Chat::Scale(double WidthRatio, double HeightRatio){
+
+void Chat::Scale(double WidthRatio, double HeightRatio) {
 	Border.x1 *= WidthRatio;
 	Border.x2 *= WidthRatio;
 	Border.y1 *= HeightRatio;
 	Border.y2 *= HeightRatio;
 
 	ResetFonts();
+
+	for (auto& pair : m_Tabs) {
+		
+		pair.second.bLayoutIsDirty = true;
+	}
 }
 
 void Chat::Resize(int nWidth, int nHeight)
 {
 	Border.x1 = 10;
-	Border.y1 = double(1080 - 300) / 1080 * RGetScreenHeight();
-	Border.x2 = (double)500 / 1920 * RGetScreenWidth();
-	Border.y2 = double(1080 - 100) / 1080 * RGetScreenHeight();
+	
+	Border.y1 = double(1080 - 280) / 1080 * RGetScreenHeight(); 
+	Border.x2 = (double)700 / 1920 * RGetScreenWidth();
+	Border.y2 = double(1080 - 40) / 1080 * RGetScreenHeight();  
 
 	ResetFonts();
+
+	for (auto& pair : m_Tabs) {
+		pair.second.bLayoutIsDirty = true;
+	}
 }
 
 void Chat::ClearHistory()
 {
-	Msgs.clear();
-	LineSegments.clear();
+	for (auto& pair : m_Tabs) {
+		auto& tab = pair.second; 
+		tab.Messages.clear();
+		tab.LineSegments.clear();
+		tab.ScrollOffsetLines = 0;
+		tab.TotalLinesInHistory = 0;
+		tab.bLayoutIsDirty = true;
+	}
 	NumNewlyAddedLines = 0;
 	ChatLinesPixelOffsetY = 0;
 }
@@ -363,11 +498,11 @@ Chat::TimeType Chat::GetTime()
 	return ZGetApplication()->GetTime();
 }
 
-bool Chat::CursorInRange(int x1, int y1, int x2, int y2){
-	return Cursor.x > x1 && Cursor.x < x2 && Cursor.y > y1 && Cursor.y < y2;
+bool Chat::CursorInRange(int x1, int y1, int x2, int y2) {
+	return Cursor.x > x1 && Cursor.x < x2&& Cursor.y > y1 && Cursor.y < y2;
 }
 
-int Chat::GetTextLength(MFontR2& Font, const wchar_t* Format, ...)
+int Chat::GetTextLength(MFontR2 & Font, const wchar_t* Format, ...)
 {
 	wchar_t buf[1024];
 	va_list va;
@@ -382,7 +517,7 @@ struct CaretType
 	int TotalTextHeight;
 	v2i CaretPos;
 };
-static CaretType GetCaretPos(MFontR2& Font, const wchar_t* Text, int CaretPos, int Width)
+static CaretType GetCaretPos(MFontR2 & Font, const wchar_t* Text, int CaretPos, int Width)
 {
 	CaretType ret{ 1, { 0, 1 } };
 	v2i Cursor{ 0, 1 };
@@ -396,7 +531,7 @@ static CaretType GetCaretPos(MFontR2& Font, const wchar_t* Text, int CaretPos, i
 			++Cursor.y;
 			Cursor.x = CharWidth;
 		}
-		
+
 		auto Distance = c - Text;
 		if (Distance == CaretPos)
 			ret.CaretPos = Cursor;
@@ -405,10 +540,10 @@ static CaretType GetCaretPos(MFontR2& Font, const wchar_t* Text, int CaretPos, i
 	return ret;
 }
 
-std::pair<bool, v2i> Chat::GetPos(const ChatMessage &c, u32 Pos)
+std::pair<bool, v2i> Chat::GetPos(const ChatTab & tab, const ChatMessage & c, u32 Pos)
 {
 	std::pair<bool, v2i> ret{ false, {0, 0} };
-	if (Pos > c.Msg.length())
+	if (Pos > c.ProcessedMsg.length())
 		return ret;
 
 	D3DRECT Output = GetOutputRect();
@@ -417,19 +552,19 @@ std::pair<bool, v2i> Chat::GetPos(const ChatMessage &c, u32 Pos)
 
 	int nLines = 0;
 
-	for (int i = Msgs.size() - 1; nLines < Limit && i >= 0; i--){
-		auto &cl = Msgs.at(i);
+	for (int i = tab.Messages.size() - 1; nLines < Limit && i >= 0; i--) {
+		auto& cl = tab.Messages.at(i);
 
-		if (&c == &cl){
+		if (&c == &cl) {
 			int nOffset = 0;
 
-			if (c.GetLines() == 1){
-				ret.second.y = Output.y2 - 5 - (nLines) * FontHeight - FontHeight * .5;
+			if (c.GetLines() == 1) {
+				ret.second.y = Output.y2 - 5 - (nLines)*FontHeight - FontHeight * .5;
 			}
-			else{
+			else {
 				int nLine = 0;
 
-				for (int i = 0; i < c.GetLines() - 1; i++){
+				for (int i = 0; i < c.GetLines() - 1; i++) {
 					if (int(Pos) < c.GetLineBreak(i)->nStartPos)
 						break;
 
@@ -443,7 +578,7 @@ std::pair<bool, v2i> Chat::GetPos(const ChatMessage &c, u32 Pos)
 			}
 
 			ret.second.x = Output.x1 + 5 + GetTextLength(DefaultFont, L"%.*s_", Pos - nOffset,
-				&c.Msg.at(nOffset)) - GetTextLength(DefaultFont, L"_");
+				&c.ProcessedMsg.at(nOffset)) - GetTextLength(DefaultFont, L"_");
 
 			ret.first = true;
 			return ret;
@@ -456,15 +591,144 @@ std::pair<bool, v2i> Chat::GetPos(const ChatMessage &c, u32 Pos)
 }
 
 bool Chat::OnEvent(MEvent* pEvent) {
-	// We want to open the chat when the chat action key is pressed and close it when enter is pressed.
-	// This is because a chat action key bound to something other than enter still has to be
-	// inputtable. E.g., if it's bound to 'y', the user still has to be able to input 'y'.
-	//
-	// However, there's a problem with this when the user has chat bound to enter: When the chat is
-	// open and the user presses enter, the char message with enter is sent, closing the chat,
-	// but then the chat action key message is sent immediately after, opening it again.
-	// Therefore, the chat would be unclosable. To fix this, we ignore the next chat action key
-	// message when enter is pressed.
+	// TAB CLICK HANDLING
+	if (pEvent->nMessage == MWM_LBUTTONDOWN) {
+		int tabX = Border.x1 + 5;
+		const int tabY = Border.y1 - 20;
+		const int tabHeight = 20;
+		const std::wstring main_key = to_lower_wstring(MAIN_TAB_NAME);
+
+
+		if (m_Tabs.count(main_key))
+		{
+			const auto& tabData = m_Tabs.at(main_key);
+			int tabWidth = DefaultFont.GetWidth(tabData.Name.c_str()) + 10;
+			if (CursorInRange(tabX, tabY, tabX + tabWidth, tabY + tabHeight)) {
+				m_sActiveTabName = main_key;
+				m_Tabs.at(main_key).UnreadCount = 0;
+				m_Tabs.at(main_key).bHasBeenAcknowledged = true; // Mark as acknowledged
+				SelectionState = {};
+				return true;
+			}
+			tabX += tabWidth + 2;
+		}
+
+
+		for (auto const& pair : m_Tabs) {
+			const auto& key = pair.first;
+			if (key == main_key) continue;
+
+			const auto& tabData = pair.second;
+			bool isInputActive = IsInputEnabled();
+
+
+			bool shouldCheckThisTab = (tabData.UnreadCount > 0) || isInputActive;
+			if (!shouldCheckThisTab) continue;
+
+			std::wstring textToDraw = tabData.Name;
+			if (tabData.UnreadCount > 0) {
+				textToDraw += L" (" + std::to_wstring(tabData.UnreadCount) + L")";
+			}
+			int tabWidth = DefaultFont.GetWidth(textToDraw.c_str()) + 10;
+
+			if (CursorInRange(tabX, tabY, tabX + tabWidth, tabY + tabHeight)) {
+				m_sActiveTabName = key;
+				m_Tabs.at(key).UnreadCount = 0;
+				m_Tabs.at(key).bHasBeenAcknowledged = true; // Mark as acknowledged
+				SelectionState = {};
+				return true;
+			}
+			tabX += tabWidth + 2;
+		}
+	}
+
+
+	if (pEvent->nMessage == MWM_RBUTTONDOWN) {
+		int tabX = Border.x1 + 5;
+		const int tabY = Border.y1 - 20;
+		const int tabHeight = 20;
+		const std::wstring main_key = to_lower_wstring(MAIN_TAB_NAME);
+		bool isMainChatFading = false;
+
+
+		if (m_Tabs.count(to_lower_wstring(MAIN_TAB_NAME))) {
+			const auto& mainTab = m_Tabs.at(to_lower_wstring(MAIN_TAB_NAME));
+			for (const auto& msg : mainTab.Messages) {
+				if (GetTime() < msg.Time + FadeTime) {
+					isMainChatFading = true;
+					break;
+				}
+			}
+		}
+
+
+		std::vector<std::wstring> tabDrawOrder;
+		if (m_Tabs.count(main_key)) {
+			tabDrawOrder.push_back(main_key);
+		}
+		for (auto const& pair : m_Tabs) {
+			if (pair.first == main_key) continue;
+			tabDrawOrder.push_back(pair.first);
+		}
+
+
+		for (const auto& key : tabDrawOrder) {
+			const auto& tabData = m_Tabs.at(key);
+			bool isInputActive = IsInputEnabled();
+
+			bool isMainTabVisible = isInputActive || isMainChatFading;
+			bool shouldCheckThisTab = (key == main_key) ? isMainTabVisible : ((tabData.UnreadCount > 0) || isInputActive);
+
+			if (!shouldCheckThisTab) continue;
+
+			std::wstring textToDraw = tabData.Name;
+			if (tabData.UnreadCount > 0) {
+				textToDraw += L" (" + std::to_wstring(tabData.UnreadCount) + L")";
+			}
+			int tabWidth = DefaultFont.GetWidth(textToDraw.c_str()) + 10;
+
+			if (CursorInRange(tabX, tabY, tabX + tabWidth, tabY + tabHeight)) {
+				// Prevent the "Main" tab from being closed.
+				if (key != main_key) {
+					if (m_sActiveTabName == key) {
+						m_sActiveTabName = main_key;
+					}
+					m_Tabs.erase(key);
+					return true;
+				}
+			}
+			tabX += tabWidth + 2;
+		}
+	}
+
+
+	if (pEvent->nMessage == MWM_MOUSEWHEEL)
+	{
+		D3DRECT TotalRect = GetTotalRect();
+		if (CursorInRange(TotalRect.x1, TotalRect.y1, TotalRect.x2, TotalRect.y2))
+		{
+			ChatTab& activeTab = GetActiveTab();
+			int WheelDelta = pEvent->nDelta;
+			const int ScrollAmount = 3;
+
+			if (WheelDelta > 0) {
+				activeTab.ScrollOffsetLines += ScrollAmount;
+			}
+			else {
+				activeTab.ScrollOffsetLines -= ScrollAmount;
+			}
+
+			auto OutputRect = GetOutputRect();
+			int VisibleLines = max(1, static_cast<int>((OutputRect.y2 - OutputRect.y1 - 10) / FontHeight));
+			int MaxScrollOffset = max(0, activeTab.TotalLinesInHistory - VisibleLines);
+			activeTab.ScrollOffsetLines = max(0, min(activeTab.ScrollOffsetLines, MaxScrollOffset));
+
+			NumNewlyAddedLines = 0;
+			ChatLinesPixelOffsetY = 0;
+
+			return true;
+		}
+	}
 
 	const auto ActionPressed = pEvent->nMessage == MWM_ACTIONPRESSED;
 	const auto CharMessage = pEvent->nMessage == MWM_CHAR;
@@ -500,8 +764,16 @@ bool Chat::OnEvent(MEvent* pEvent) {
 	{
 		if (InputEnabled && ChatPressed && !InputField.empty())
 		{
+			std::wstring finalMessage = InputField;
+
+			if (m_sActiveTabName != to_lower_wstring(MAIN_TAB_NAME))
+			{
+				const std::wstring& displayName = GetActiveTab().Name;
+				finalMessage = L"/whisper " + displayName + L" " + InputField;
+			}
+
 			char MultiByteString[1024];
-			CodePageConversion<CP_UTF8>(MultiByteString, InputField.c_str());
+			CodePageConversion<CP_UTF8>(MultiByteString, finalMessage.c_str());
 
 			ZGetGameInterface()->GetChat()->Input(MultiByteString);
 
@@ -510,12 +782,15 @@ bool Chat::OnEvent(MEvent* pEvent) {
 
 			InputField.clear();
 			CaretPos = -1;
+
+			GetActiveTab().ScrollOffsetLines = 0;
 		}
 
 		EnableInput(!InputEnabled, TeamChatPressed);
 	}
 
 	if (pEvent->nMessage == MWM_KEYDOWN) {
+		ChatTab& activeTab = GetActiveTab();
 		switch (pEvent->nKey) {
 
 		case VK_HOME:
@@ -527,31 +802,6 @@ bool Chat::OnEvent(MEvent* pEvent) {
 			break;
 
 		case VK_TAB:
-			/*bPlayerList = !bPlayerList;
-			if (bPlayerList){
-			#ifdef DEBUG
-			vstrPlayerList.push_back(std::string("test1"));
-			vstrPlayerList.push_back(std::string("test2"));
-			#endif DEBUG
-			nPlayerListWidth = 0;
-			for (auto &it : *ZGetCharacterManager()){
-			ZCharacter &Player = *it.second;
-			vstrPlayerList.push_back(std::string(Player.GetProperty()->szName));
-
-			int nLen = GetTextLen(vstrPlayerList.back().c_str(), -1);
-			if (nLen > nPlayerListWidth)
-			nPlayerListWidth = nLen;
-			}
-
-			nCurPlayer = 0;
-			}
-			else{
-			std::string &strEntry = vstrPlayerList.at(nCurPlayer);
-			InputField.insert(CaretPos + 1, strEntry);
-			CaretPos += strEntry.length();
-			vstrPlayerList.clear();
-			}*/
-
 		{
 			size_t StartPos = InputField.rfind(' ');
 			if (StartPos == std::string::npos)
@@ -566,10 +816,10 @@ bool Chat::OnEvent(MEvent* pEvent) {
 
 			auto PartialName = InputField.data() + StartPos;
 
-			for (auto &it : *ZGetCharacterManager())
+			for (auto& it : *ZGetCharacterManager())
 			{
-				ZCharacter &Player = *it.second;
-				const char *PlayerName = Player.GetProperty()->szName;
+				ZCharacter& Player = *it.second;
+				const char* PlayerName = Player.GetProperty()->szName;
 				size_t PlayerNameLength = strlen(PlayerName);
 
 				if (PlayerNameLength < PartialNameLength)
@@ -601,13 +851,27 @@ bool Chat::OnEvent(MEvent* pEvent) {
 
 		break;
 
-		case VK_UP:
-			/*if (bPlayerList){
-				if (nCurPlayer > 0)
-					nCurPlayer--;
-				break;
-			}*/
+		case VK_PRIOR:
+		{
+			auto OutputRect = GetOutputRect();
+			int VisibleLines = max(1, static_cast<int>((OutputRect.y2 - OutputRect.y1 - 10) / FontHeight));
+			activeTab.ScrollOffsetLines -= VisibleLines;
+			NumNewlyAddedLines = 0;
+			ChatLinesPixelOffsetY = 0;
+			break;
+		}
 
+		case VK_NEXT:
+		{
+			auto OutputRect = GetOutputRect();
+			int VisibleLines = max(1, static_cast<int>((OutputRect.y2 - OutputRect.y1 - 10) / FontHeight));
+			activeTab.ScrollOffsetLines += VisibleLines;
+			NumNewlyAddedLines = 0;
+			ChatLinesPixelOffsetY = 0;
+			break;
+		}
+
+		case VK_UP:
 			if (CurInputHistoryEntry > 0) {
 				CurInputHistoryEntry--;
 				InputField.assign(InputHistory.at(CurInputHistoryEntry));
@@ -616,12 +880,6 @@ bool Chat::OnEvent(MEvent* pEvent) {
 			break;
 
 		case VK_DOWN:
-			/*if (bPlayerList){
-				if (nCurPlayer < int(vstrPlayerList.size()) - 1)
-					nCurPlayer++;
-				break;
-			}*/
-
 			if (CurInputHistoryEntry < int(InputHistory.size()) - 1) {
 				CurInputHistoryEntry++;
 				auto&& strEntry = InputHistory.at(CurInputHistoryEntry);
@@ -647,20 +905,26 @@ bool Chat::OnEvent(MEvent* pEvent) {
 
 		case 'V':
 		{
-			if (!pEvent->bCtrl)
-				break;
-
-			wchar_t Clipboard[256];
-			MClipboard::Get(g_hWnd, Clipboard, std::size(Clipboard));
-			if (InputField.length() + wcslen(Clipboard) > MAX_INPUT_LENGTH)
+			if (pEvent->bCtrl) // If Ctrl is held, do the paste action
 			{
-				InputField.append(Clipboard, Clipboard + MAX_INPUT_LENGTH - InputField.length());
+				wchar_t Clipboard[256];
+				MClipboard::Get(g_hWnd, Clipboard, std::size(Clipboard));
+				if (InputField.length() + wcslen(Clipboard) > MAX_INPUT_LENGTH)
+				{
+					InputField.append(Clipboard, Clipboard + MAX_INPUT_LENGTH - InputField.length());
+				}
+				else
+				{
+					InputField += Clipboard;
+				}
 			}
-			else
+			else // Otherwise, if V is pressed alone
 			{
-				InputField += Clipboard;
+				if (!IsInputEnabled()) // And if the chat window is closed
+				{
+					m_bNotificationsMuted = !m_bNotificationsMuted; // Toggle the flag
+				}
 			}
-
 			break;
 		}
 
@@ -680,12 +944,14 @@ bool Chat::OnEvent(MEvent* pEvent) {
 			}
 			break;
 		case VK_ESCAPE:
+			Resize(RGetScreenWidth(), RGetScreenHeight());
+
 			EnableInput(false, false);
 			break;
 
 		default:
 			if (InputField.length() < MAX_INPUT_LENGTH) {
-				if (pEvent->nKey < 27) // Ctrl + A-Z
+				if (pEvent->nKey < 27)
 					break;
 
 				InputField.insert(CaretPos + 1, 1, pEvent->nKey);
@@ -724,99 +990,124 @@ bool Chat::OnEvent(MEvent* pEvent) {
 	return true;
 }
 
-int Chat::GetTextLen(ChatMessage &cl, int Pos, int Count){
-	return GetTextLength(DefaultFont, L"_%.*s_", Count, &cl.Msg.at(Pos)) - GetTextLength(DefaultFont, L"__");
+int Chat::GetTextLen(ChatMessage & cl, int Pos, int Count) {
+	return GetTextLength(DefaultFont, L"_%.*s_", Count, &cl.ProcessedMsg.at(Pos)) - GetTextLength(DefaultFont, L"__");
 }
 
-int Chat::GetTextLen(const char *Msg, int Count){
+int Chat::GetTextLen(const char* Msg, int Count) {
 	return GetTextLength(DefaultFont, L"_%.*s_", Count, Msg) - GetTextLength(DefaultFont, L"__");
 }
 
-void Chat::OnUpdate(float TimeDelta){
+void Chat::OnUpdate(float TimeDelta) {
 	UpdateNewMessagesAnimation(TimeDelta);
 
 	if (!IsInputEnabled())
 		return;
 
+	ChatTab& activeTab = GetActiveTab();
 	auto PrevCursorPos = Cursor;
 	Cursor = MEvent::LatestPos;
 
-	v2 MinimumSize{ 192.f * RGetScreenWidth() / 1920.f, 108.f * RGetScreenHeight() / 1080.f };
+	if (m_bDragAndResizeEnabled) {
+		v2 MinimumSize{ 192.f * RGetScreenWidth() / 1920.f, 108.f * RGetScreenHeight() / 1080.f };
 
-	if (ResizeFlags){
-		if (ResizeFlags & ResizeFlagsType::X1 &&
-			Border.x1 + Cursor.x - PrevCursorPos.x < Border.x2 - MinimumSize.x) {
+		if (ResizeFlags) {
+			SelectionState = {};
+			if (ResizeFlags & ResizeFlagsType::X1 &&
+				Border.x1 + Cursor.x - PrevCursorPos.x < Border.x2 - MinimumSize.x) {
+				Border.x1 += Cursor.x - PrevCursorPos.x;
+			}
+			if (ResizeFlags & ResizeFlagsType::X2 &&
+				Border.x2 + Cursor.x - PrevCursorPos.x > Border.x1 + MinimumSize.x) {
+				Border.x2 += Cursor.x - PrevCursorPos.x;
+			}
+			if (ResizeFlags & ResizeFlagsType::Y1 &&
+				Border.y1 + Cursor.y - PrevCursorPos.y < Border.y2 - MinimumSize.y) {
+				Border.y1 += Cursor.y - PrevCursorPos.y;
+			}
+			if (ResizeFlags & ResizeFlagsType::Y2 &&
+				Border.y2 + Cursor.y - PrevCursorPos.y > Border.y1 + MinimumSize.y) {
+				Border.y2 += Cursor.y - PrevCursorPos.y;
+			}
+
+			for (auto& pair : m_Tabs) {
+				pair.second.bLayoutIsDirty = true;
+			}
+		}
+
+		if (Action == ChatWindowAction::Moving) {
 			Border.x1 += Cursor.x - PrevCursorPos.x;
-		}
-		if (ResizeFlags & ResizeFlagsType::X2 &&
-			Border.x2 + Cursor.x - PrevCursorPos.x > Border.x1 + MinimumSize.x) {
-			Border.x2 += Cursor.x - PrevCursorPos.x;
-		}
-		if (ResizeFlags & ResizeFlagsType::Y1 &&
-			Border.y1 + Cursor.y - PrevCursorPos.y < Border.y2 - MinimumSize.y) {
 			Border.y1 += Cursor.y - PrevCursorPos.y;
-		}
-		if (ResizeFlags & ResizeFlagsType::Y2 &&
-			Border.y2 + Cursor.y - PrevCursorPos.y > Border.y1 + MinimumSize.y) {
+			Border.x2 += Cursor.x - PrevCursorPos.x;
 			Border.y2 += Cursor.y - PrevCursorPos.y;
 		}
-
-		LineSegments.clear();
-		for (int i = 0; i < int(Msgs.size()); ++i)
-			DivideIntoLines(i, std::back_inserter(LineSegments));
 	}
 
-	if (Action == ChatWindowAction::Moving){
-		Border.x1 += Cursor.x - PrevCursorPos.x;
-		Border.y1 += Cursor.y - PrevCursorPos.y;
-		Border.x2 += Cursor.x - PrevCursorPos.x;
-		Border.y2 += Cursor.y - PrevCursorPos.y;
+	if (Action == ChatWindowAction::Scrolling)
+	{
+		auto Output = GetOutputRect();
+		int VisibleLines = max(1, static_cast<int>((Output.y2 - Output.y1 - 10) / FontHeight));
+		float TrackHeight = static_cast<float>(Output.y2 - Output.y1);
+
+		float RelativeCursorY = (Cursor.y - Output.y1) / TrackHeight;
+		RelativeCursorY = max(0.f, min(1.f, RelativeCursorY));
+
+		if (activeTab.TotalLinesInHistory - VisibleLines > 0)
+			activeTab.ScrollOffsetLines = static_cast<int>((1.0f - RelativeCursorY) * (activeTab.TotalLinesInHistory - VisibleLines));
+		else
+			activeTab.ScrollOffsetLines = 0;
 	}
 
 	if (SelectionState.FromMsg && SelectionState.ToMsg &&
-		MEvent::IsKeyDown(VK_CONTROL) && MEvent::IsKeyDown('C')){
-		if (OpenClipboard(g_hWnd)){
+		MEvent::IsKeyDown(VK_CONTROL) && MEvent::IsKeyDown('C')) {
+		if (OpenClipboard(g_hWnd)) {
 			EmptyClipboard();
 
-			if (SelectionState.FromMsg == SelectionState.ToMsg){
+			if (SelectionState.FromMsg == SelectionState.ToMsg) {
 				auto index = min(SelectionState.FromPos, SelectionState.ToPos);
-				auto str = SelectionState.FromMsg->Msg.substr(index);
+				auto count = max(SelectionState.FromPos, SelectionState.ToPos) - index;
+				auto str = SelectionState.FromMsg->ProcessedMsg.substr(index, count + 1);
 				MClipboard::Set(g_hWnd, str);
 			}
-			else{
+			else {
 				std::wstring str;
 
-				bool FirstFound = false;
+				const ChatMessage* pStartMsg, * pEndMsg;
+				int nStartPos, nEndPos;
 
-				for (auto it = Msgs.begin(); it != Msgs.end(); it++){
-					auto* pcl = &*it;
+				if (SelectionState.FromMsg < SelectionState.ToMsg) {
+					pStartMsg = SelectionState.FromMsg;
+					nStartPos = SelectionState.FromPos;
+					pEndMsg = SelectionState.ToMsg;
+					nEndPos = SelectionState.ToPos;
+				}
+				else {
+					pStartMsg = SelectionState.ToMsg;
+					nStartPos = SelectionState.ToPos;
+					pEndMsg = SelectionState.FromMsg;
+					nEndPos = SelectionState.FromPos;
+				}
 
-					if (pcl == SelectionState.FromMsg || pcl == SelectionState.ToMsg){
-						if (!FirstFound){
-							auto nPos = pcl == SelectionState.FromMsg ?
-								SelectionState.FromPos : SelectionState.ToPos;
-							str.append(&pcl->Msg.at(nPos));
+				for (auto it = activeTab.Messages.begin(); it != activeTab.Messages.end(); it++) {
+					const auto* pcl = &*it;
 
-							FirstFound = true;
-							continue;
-						}
-						else{
-							auto nPos = pcl == SelectionState.FromMsg ?
-								SelectionState.FromPos : SelectionState.ToPos;
-							str.append(L"\n");
-							str.append(pcl->Msg.c_str(), nPos + 2);
+					if (pcl < pStartMsg) continue;
+					if (pcl > pEndMsg) break;
 
-							break;
-						}
+					if (pcl == pStartMsg) {
+						str.append(pStartMsg->ProcessedMsg.substr(nStartPos));
 					}
-
-					if (FirstFound){
+					else if (pcl == pEndMsg) {
 						str.append(L"\n");
-						str.append(pcl->Msg.c_str());
+						str.append(pEndMsg->ProcessedMsg.substr(0, nEndPos + 1));
+					}
+					else {
+						str.append(L"\n");
+						str.append(pcl->ProcessedMsg);
 					}
 				}
 
-				if (FirstFound){
+				if (!str.empty()) {
 					MClipboard::Set(g_hWnd, str);
 				}
 			}
@@ -827,146 +1118,128 @@ void Chat::OnUpdate(float TimeDelta){
 
 	const int nBorderWidth = 5;
 
-	// TODO: Move to OnEvent
+	bool bLeftButtonPressed = MEvent::IsKeyDown(VK_LBUTTON) && !m_bLeftButtonDownLastFrame;
+
 	if (MEvent::IsKeyDown(VK_LBUTTON)) {
 		if (Action == ChatWindowAction::None) {
-			D3DRECT tr = GetTotalRect();
+			D3DRECT LockButtonRect = { Border.x1 + 5, Border.y1 - 18, Border.x1 + 5 + 12, Border.y1 - 18 + FontHeight };
 
-			if (CursorInRange(tr.x1 - nBorderWidth, tr.y1 - nBorderWidth,
-				tr.x1 + nBorderWidth, tr.y2 + nBorderWidth)) {
-				ResizeFlags |= ResizeFlagsType::X1;
+			if (bLeftButtonPressed && CursorInRange(LockButtonRect.x1, LockButtonRect.y1, LockButtonRect.x2, LockButtonRect.y2))
+			{
+				m_bDragAndResizeEnabled = !m_bDragAndResizeEnabled;
 			}
-			if (CursorInRange(tr.x1 - nBorderWidth, tr.y1 - nBorderWidth,
-				tr.x2 + nBorderWidth, tr.y1 + nBorderWidth)) {
-				ResizeFlags |= ResizeFlagsType::Y1;
+			else if (bLeftButtonPressed && CursorInRange(Border.x2 - 15, Border.y1 - 18, Border.x2 - 15 + 12, Border.y1 - 18 + FontHeight))
+			{
+				Resize(RGetScreenWidth(), RGetScreenHeight());
 			}
-			if (CursorInRange(tr.x2 - nBorderWidth, tr.y1 - nBorderWidth,
-				tr.x2 + nBorderWidth, tr.y2 + nBorderWidth)) {
-				ResizeFlags |= ResizeFlagsType::X2;
-			}
-			if (CursorInRange(tr.x1 - nBorderWidth, tr.y2 - nBorderWidth,
-				tr.x2 + nBorderWidth, tr.y2 + nBorderWidth)) {
-				ResizeFlags |= ResizeFlagsType::Y2;
-			}
+			else
+			{
+				D3DRECT tr = GetTotalRect();
+				const int ScrollbarWidth = 15;
+				auto Output = GetOutputRect();
+				int VisibleLines = max(1, static_cast<int>((Output.y2 - Output.y1 - 10) / FontHeight));
+				D3DRECT ScrollbarTrackRect = { Output.x2 - ScrollbarWidth, Output.y1, Output.x2, Output.y2 };
 
-			if (ResizeFlags)
-				Action = ChatWindowAction::Resizing;
-		}
+				if (CursorInRange(ScrollbarTrackRect.x1, ScrollbarTrackRect.y1, ScrollbarTrackRect.x2, ScrollbarTrackRect.y2) && activeTab.TotalLinesInHistory > VisibleLines) {
+					Action = ChatWindowAction::Scrolling;
+					NumNewlyAddedLines = 0;
+					ChatLinesPixelOffsetY = 0;
+				}
+				else if (m_bDragAndResizeEnabled) {
+					if (CursorInRange(tr.x1 - nBorderWidth, tr.y1 - nBorderWidth, tr.x1 + nBorderWidth, tr.y2 + nBorderWidth)) ResizeFlags |= ResizeFlagsType::X1;
+					if (CursorInRange(tr.x1 - nBorderWidth, tr.y1 - nBorderWidth, tr.x2 + nBorderWidth, tr.y1 + nBorderWidth)) ResizeFlags |= ResizeFlagsType::Y1;
+					if (CursorInRange(tr.x2 - nBorderWidth, tr.y1 - nBorderWidth, tr.x2 + nBorderWidth, tr.y2 + nBorderWidth)) ResizeFlags |= ResizeFlagsType::X2;
+					if (CursorInRange(tr.x1 - nBorderWidth, tr.y2 - nBorderWidth, tr.x2 + nBorderWidth, tr.y2 + nBorderWidth)) ResizeFlags |= ResizeFlagsType::Y2;
 
-		if (CursorInRange(Border.x2 - 15, Border.y1 - 18, Border.x2 - 15 + 12, Border.y1 - 18 + FontHeight) &&
-			Action == ChatWindowAction::None) {
-			Border.x1 = 10;
-			Border.y1 = double(1080 - 300) / 1080 * RGetScreenHeight();
-			Border.x2 = (double)500 / 1920 * RGetScreenWidth();
-			Border.y2 = double(1080 - 100) / 1080 * RGetScreenHeight();
-		}
-		else if (CursorInRange(Border.x1 + 5, Border.y1 + 5, Border.x2 - 5, Border.y2 - 5)) {
-			if (Action != ChatWindowAction::Selecting) {
-				auto&& Output = GetOutputRect();
-
-				int Limit = (Output.y2 - Output.y1 - 10) / FontHeight;
-				int Line = Limit - ((Output.y2 - 5) - Cursor.y) / FontHeight;
-
-				int i = Msgs.size() - 1;
-				int CurLine = Limit + 1;
-
-				while (i >= 0){
-					auto&& cl = Msgs[i];
-
-					if (CurLine - cl.GetLines() <= Line){
-						SelectionState.FromMsg = &cl;
-						Action = ChatWindowAction::Selecting;
-
-						auto Pos = CurLine - cl.GetLines() == Line ?
-							0 : cl.GetLineBreak(Line - (CurLine - cl.GetLines()) - 1)->nStartPos;
-						int x = Cursor.x - (Output.x1 + 5);
-						int Len = 0;
-
-						while (x > Len && Pos < int(cl.Msg.length())){
-							Len += GetTextLen(cl, Pos, 1);
-							Pos++;
-						}
-
-						Pos--;
-
-						if (Len - GetTextLen(cl, Pos, 1) / 2 > x)
-							SelectionState.FromPos = Pos - 1;
-						else
-							SelectionState.FromPos = Pos;
-
-						break;
+					if (ResizeFlags) {
+						Action = ChatWindowAction::Resizing;
 					}
-
-					CurLine -= cl.GetLines();
-					i--;
-				}
-
-				if (i < 0){
-					SelectionState.FromMsg = 0;
-					SelectionState.ToMsg = 0;
-				}
-			}
-			else{
-				auto&& Output = GetOutputRect();
-
-				int Limit = (Output.y2 - Output.y1 - 10) / FontHeight;
-				int Line = Limit - ((Output.y2 - 5) - Cursor.y) / FontHeight;
-
-				int i = Msgs.size() - 1;
-				int CurLine = Limit + 1;
-
-				while (i >= 0){
-					auto&& cl = Msgs.at(i);
-
-					if (CurLine - cl.GetLines() <= Line || i == 0){
-						SelectionState.ToMsg = &cl;
-
-						int Pos;
-
-						if (CurLine - cl.GetLines() <= Line)
-							Pos = CurLine - cl.GetLines() == Line ?
-								0 : cl.GetLineBreak(Line - (CurLine - cl.GetLines()) - 1)->nStartPos;
-						else
-							Pos = 0;
-
-						int x = Cursor.x - (Output.x1 + 5);
-						int nLen = 0;
-
-						while (x > nLen && Pos < int(cl.Msg.length())){
-							nLen += GetTextLen(cl, Pos, 1);
-							Pos++;
-						}
-
-						Pos--;
-
-						if (nLen - GetTextLen(cl, Pos, 1) / 2 > x)
-							SelectionState.ToPos = Pos - 1;
-						else
-							SelectionState.ToPos = Pos;
-
-						break;
+					else if (CursorInRange(Border.x1, Border.y1 - 20, Border.x2 + 1, Border.y1)) {
+						Action = ChatWindowAction::Moving;
 					}
-
-					CurLine -= cl.GetLines();
-					i--;
 				}
 			}
 		}
-		else if (Action != ChatWindowAction::Selecting){
-			SelectionState.FromMsg = 0;
-			SelectionState.ToMsg = 0;
-		}
 
-		if (Action == ChatWindowAction::None &&
-			CursorInRange(Border.x1, Border.y1 - 20, Border.x2 + 1, Border.y1))
-			Action = ChatWindowAction::Moving;
+		if (Action == ChatWindowAction::None || Action == ChatWindowAction::Selecting) {
+			if (CursorInRange(Border.x1 + 5, Border.y1 + 5, Border.x2 - 5, Border.y2 - 5)) {
+				if (Action != ChatWindowAction::Selecting) {
+					auto&& Output = GetOutputRect();
+					int Limit = (Output.y2 - Output.y1 - 10) / FontHeight;
+					int Line = Limit - ((Output.y2 - 5) - Cursor.y) / FontHeight;
+					int i = activeTab.Messages.size() - 1;
+					int CurLine = Limit + 1;
+					while (i >= 0) {
+						auto&& cl = activeTab.Messages[i];
+						if (CurLine - cl.GetLines() <= Line) {
+							SelectionState.FromMsg = &cl;
+							Action = ChatWindowAction::Selecting;
+							auto Pos = CurLine - cl.GetLines() == Line ? 0 : cl.GetLineBreak(Line - (CurLine - cl.GetLines()) - 1)->nStartPos;
+							int x = Cursor.x - (Output.x1 + 5);
+							int Len = 0;
+							while (x > Len && Pos < int(cl.ProcessedMsg.length())) {
+								Len += GetTextLen(cl, Pos, 1);
+								Pos++;
+							}
+							Pos--;
+							if (Len - GetTextLen(cl, Pos, 1) / 2 > x) SelectionState.FromPos = Pos - 1;
+							else SelectionState.FromPos = Pos;
+							break;
+						}
+						CurLine -= cl.GetLines();
+						i--;
+					}
+					if (i < 0) { SelectionState.FromMsg = 0; SelectionState.ToMsg = 0; }
+				}
+				else {
+					auto&& Output = GetOutputRect();
+					int Limit = (Output.y2 - Output.y1 - 10) / FontHeight;
+					int Line = Limit - ((Output.y2 - 5) - Cursor.y) / FontHeight;
+					int i = activeTab.Messages.size() - 1;
+					int CurLine = Limit + 1;
+					while (i >= 0) {
+						auto&& cl = activeTab.Messages.at(i);
+						if (CurLine - cl.GetLines() <= Line || i == 0) {
+							SelectionState.ToMsg = &cl;
+							int Pos;
+							if (CurLine - cl.GetLines() <= Line) Pos = CurLine - cl.GetLines() == Line ? 0 : cl.GetLineBreak(Line - (CurLine - cl.GetLines()) - 1)->nStartPos;
+							else Pos = 0;
+							int x = Cursor.x - (Output.x1 + 5);
+							int nLen = 0;
+							while (x > nLen && Pos < int(cl.ProcessedMsg.length())) {
+								nLen += GetTextLen(cl, Pos, 1);
+								Pos++;
+							}
+							Pos--;
+							if (nLen - GetTextLen(cl, Pos, 1) / 2 > x) SelectionState.ToPos = Pos - 1;
+							else SelectionState.ToPos = Pos;
+							break;
+						}
+						CurLine -= cl.GetLines();
+						i--;
+					}
+				}
+			}
+			else if (Action != ChatWindowAction::Selecting) {
+				SelectionState.FromMsg = 0;
+				SelectionState.ToMsg = 0;
+			}
+		}
 	}
 	else
 	{
 		Action = ChatWindowAction::None;
 		ResizeFlags = 0;
 	}
+
+	m_bLeftButtonDownLastFrame = MEvent::IsKeyDown(VK_LBUTTON);
+
+	auto OutputRect = GetOutputRect();
+	int VisibleLines = max(1, static_cast<int>((OutputRect.y2 - OutputRect.y1 - 10) / FontHeight));
+	int MaxScrollOffset = max(0, activeTab.TotalLinesInHistory - VisibleLines);
+	activeTab.ScrollOffsetLines = max(0, min(activeTab.ScrollOffsetLines, MaxScrollOffset));
 }
+
 
 void Chat::UpdateNewMessagesAnimation(float TimeDelta)
 {
@@ -974,7 +1247,7 @@ void Chat::UpdateNewMessagesAnimation(float TimeDelta)
 		return;
 	}
 
-	constexpr auto LinesPerSecond = 4;
+	constexpr auto LinesPerSecond = 8;
 
 	auto PixelDelta = TimeDelta * FontHeight * LinesPerSecond;
 	ChatLinesPixelOffsetY -= PixelDelta;
@@ -986,24 +1259,22 @@ void Chat::UpdateNewMessagesAnimation(float TimeDelta)
 	}
 }
 
-D3DRECT Chat::GetOutputRect(){
+D3DRECT Chat::GetOutputRect() {
 	D3DRECT r = { Border.x1, Border.y1, Border.x2, Border.y2 - FontHeight };
 	return r;
 }
 
-D3DRECT Chat::GetInputRect(){
+D3DRECT Chat::GetInputRect() {
 	D3DRECT r = { Border.x1, Border.y2 - FontHeight, Border.x2, Border.y2 + (InputHeight - 1) * FontHeight };
 	return r;
 }
 
-D3DRECT Chat::GetTotalRect(){
+D3DRECT Chat::GetTotalRect() {
 	D3DRECT r = { Border.x1, Border.y1 - 20, Border.x2, Border.y2 };
 	return r;
 }
 
-// Converts a D3DRECT, which is specified in terms of the coordinates of each corner,
-// to an MRECT, which is specified in terms of the top left coordinate and the extents.
-static MRECT MakeMRECT(const D3DRECT& src)
+static MRECT MakeMRECT(const D3DRECT & src)
 {
 	return{
 		src.x1,
@@ -1015,37 +1286,181 @@ static MRECT MakeMRECT(const D3DRECT& src)
 
 void Chat::OnDraw(MDrawContext* pDC)
 {
+	if (!m_bEmojisInitialized) {
+		InitializeEmojis();
+		m_bEmojisInitialized = true;
+	}
+
 	if (HideAlways ||
 		(HideDuringReplays && ZGetGame()->IsReplay()))
 		return;
 
-	bool ShowAll = ZIsActionKeyDown(ZACTION_SHOW_FULL_CHAT) && !InputEnabled;
-	auto&& Output = GetOutputRect();
-
-	int CeiledLimit, FlooredLimit;
-	if (ShowAll)
-	{
-		CeiledLimit = FlooredLimit = (Output.y2 - 5) / FontHeight;
-	}
-	else
-	{
-		auto Limit = float(Output.y2 - Output.y1 - 10) / FontHeight;
-		FlooredLimit = int(Limit);
-		CeiledLimit = int(ceil(Limit));
+	// Master override to completely hide chat if muted by the user.
+	if (m_bNotificationsMuted && !IsInputEnabled()) {
+		return;
 	}
 
 	auto Time = GetTime();
 
-	DrawBackground(pDC, Time, NumNewlyAddedLines > 0 ? CeiledLimit : FlooredLimit, ShowAll);
-	DrawChatLines(pDC, Time, InputEnabled ? CeiledLimit : FlooredLimit, ShowAll);
-	DrawSelection(pDC);
-	
-	if (IsInputEnabled()) {
-		DrawFrame(pDC, Time);
+	bool isInputActive = IsInputEnabled();
+
+	bool isMainChatFading = false;
+	if (m_Tabs.count(to_lower_wstring(MAIN_TAB_NAME))) {
+		const auto& mainTab = m_Tabs.at(to_lower_wstring(MAIN_TAB_NAME));
+		for (const auto& msg : mainTab.Messages) {
+			if (Time < msg.Time + FadeTime) {
+				isMainChatFading = true;
+				break;
+			}
+		}
+	}
+	bool isMainChatVisible = isInputActive || isMainChatFading;
+
+	// Check if there are any unacknowledged whispers to display as vertical notifications.
+	bool hasVisibleNotifications = false;
+	for (const auto& pair : m_Tabs) {
+		if (pair.first != to_lower_wstring(MAIN_TAB_NAME) && pair.second.UnreadCount > 0 && !pair.second.bHasBeenAcknowledged) {
+			hasVisibleNotifications = true;
+			break;
+		}
+	}
+
+	// If nothing is visible or needs to be notified, exit.
+	if (!isMainChatVisible && !hasVisibleNotifications) {
+		return;
+	}
+
+	// Logic to switch between vertical notifications and the full chat window.
+	if (!isInputActive && hasVisibleNotifications)
+	{
+		// PATH 1: Chat is "closed", only draw vertical notifications.
+		DefaultFont.m_Font.BeginFont();
+
+		int yPos = Border.y2 - FontHeight;
+		const int xPos = Border.x1 + 5;
+		const std::wstring main_key = to_lower_wstring(MAIN_TAB_NAME);
+
+		// Loop through all tabs to find the ones that need a notification.
+		for (const auto& pair : m_Tabs)
+		{
+			// Draw if the tab has unread messages AND has not been acknowledged yet.
+			if (pair.first != main_key && pair.second.UnreadCount > 0 && !pair.second.bHasBeenAcknowledged)
+			{
+				std::wstring textToDraw = pair.second.Name + L" (" + std::to_wstring(pair.second.UnreadCount) + L")";
+
+				u32 textColor = ARGB(255, 255, 255, 255);
+				u32 bgColor = ARGB(220, 190, 160, 60);
+				int textWidth = DefaultFont.GetWidth(textToDraw.c_str());
+
+				pDC->SetColor(bgColor);
+				//pDC->FillRectangle(xPos, yPos, textWidth + 10, FontHeight);
+
+				DefaultFont.m_Font.DrawText(xPos + 5, yPos + 1, textToDraw.c_str(), textColor);
+
+				yPos -= (FontHeight + 3);
+			}
+		}
+		DefaultFont.m_Font.EndFont();
+	}
+	else
+	{
+		// PATH 2: Chat is active or fading, draw the full chat window.
+		ChatTab& activeTab = GetActiveTab();
+		if (activeTab.bLayoutIsDirty) {
+			activeTab.LineSegments.clear();
+			activeTab.TotalLinesInHistory = 0;
+			for (size_t i = 0; i < activeTab.Messages.size(); ++i) {
+				auto& chat_msg = activeTab.Messages[i];
+				chat_msg.ProcessedMsg = chat_msg.OriginalMsg;
+				chat_msg.FormatSpecifiers.clear();
+				chat_msg.SubstituteFormatSpecifiers(m_EmojiMap);
+				DivideIntoLines(activeTab, i, std::back_inserter(activeTab.LineSegments));
+				activeTab.TotalLinesInHistory += chat_msg.GetLines();
+			}
+			activeTab.bLayoutIsDirty = false;
+		}
+
+		// Draw Tabs (Horizontally)
+		int tabX = Border.x1 + 5;
+		const int tabY = Border.y1 - 20;
+		const int tabHeight = 20;
+		const std::wstring main_key = to_lower_wstring(MAIN_TAB_NAME);
+
+		DefaultFont.m_Font.BeginFont();
+
+		if (isMainChatVisible && m_Tabs.count(main_key))
+		{
+			const auto& tabData = m_Tabs.at(main_key);
+			const std::wstring& displayName = tabData.Name;
+			int tabWidth = DefaultFont.GetWidth(displayName.c_str()) + 10;
+			u32 textColor = TextColor;
+
+			if (main_key == m_sActiveTabName) {
+				u32 tabColor = ARGB(255, 0, 165, 195);
+				textColor = ARGB(255, 255, 255, 255);
+				pDC->SetColor(tabColor);
+			}
+
+			DefaultFont.m_Font.DrawText(tabX + 5, tabY + 2, displayName.c_str(), textColor);
+			tabX += tabWidth + 2;
+		}
+
+
+		for (const auto& pair : m_Tabs) {
+			const auto& key = pair.first;
+			if (key == main_key) continue;
+
+			const auto& tabData = pair.second;
+			bool shouldDrawThisTab = (tabData.UnreadCount > 0) || isInputActive;
+			if (!shouldDrawThisTab) continue;
+
+			std::wstring textToDraw = tabData.Name;
+			if (tabData.UnreadCount > 0) {
+				textToDraw += L" (" + std::to_wstring(tabData.UnreadCount) + L")";
+			}
+
+			int tabWidth = DefaultFont.GetWidth(textToDraw.c_str()) + 10;
+			u32 textColor = TextColor;
+
+			if (key == m_sActiveTabName) {
+				u32 tabColor = ARGB(255, 0, 165, 195);
+				textColor = ARGB(255, 255, 255, 255);
+				pDC->SetColor(tabColor);
+			}
+			else if (tabData.UnreadCount > 0) {
+				u32 tabColor = ARGB(255, 190, 160, 60);
+				textColor = ARGB(255, 255, 255, 255);
+				pDC->SetColor(tabColor);
+			}
+
+			DefaultFont.m_Font.DrawText(tabX + 5, tabY + 2, textToDraw.c_str(), textColor);
+			tabX += tabWidth + 2;
+		}
+		DefaultFont.m_Font.EndFont();
+
+		if (isMainChatVisible) {
+			bool ShowAll = ZIsActionKeyDown(ZACTION_SHOW_FULL_CHAT) && !InputEnabled;
+			auto&& Output = GetOutputRect();
+			int CeiledLimit, FlooredLimit;
+			if (ShowAll) {
+				CeiledLimit = FlooredLimit = (Output.y2 - 5) / FontHeight;
+			}
+			else {
+				auto Limit = float(Output.y2 - Output.y1 - 10) / FontHeight;
+				FlooredLimit = int(Limit);
+				CeiledLimit = int(ceil(Limit));
+			}
+			DrawBackground(pDC, activeTab, Time, NumNewlyAddedLines > 0 ? CeiledLimit : FlooredLimit, ShowAll);
+			DrawChatLines(pDC, activeTab, Time, isInputActive ? CeiledLimit : FlooredLimit, ShowAll);
+			DrawSelection(pDC, activeTab);
+			if (isInputActive) {
+				DrawScrollbar(pDC, activeTab, FlooredLimit);
+				DrawFrame(pDC, Time);
+			}
+		}
 	}
 }
-
-int Chat::DrawTextWordWrap(MFontR2& Font, const WStringView& Str, const D3DRECT &r, u32 Color)
+int Chat::DrawTextWordWrap(MFontR2 & Font, const WStringView & Str, const D3DRECT & r, u32 Color)
 {
 	int Lines = 1;
 	int StringLength = int(Str.size());
@@ -1075,17 +1490,16 @@ int Chat::DrawTextWordWrap(MFontR2& Font, const WStringView& Str, const D3DRECT 
 	return Lines;
 }
 
-void Chat::DrawTextN(MFontR2& pFont, const WStringView& Str, const D3DRECT &r, u32 Color)
+void Chat::DrawTextN(MFontR2 & pFont, const WStringView & Str, const D3DRECT & r, u32 Color)
 {
 	pFont.m_Font.DrawText(r.x1, r.y1, Str, Color);
 }
 
-void Chat::DrawBorder(MDrawContext* pDC)
+void Chat::DrawBorder(MDrawContext * pDC)
 {
 	auto rect = Border;
 	rect.y2 += (InputHeight - 1) * FontHeight;
 
-	// Draw the box outline
 	v2 vs[] = {
 		{ float(rect.x1), float(rect.y1) },
 		{ float(rect.x2), float(rect.y1) },
@@ -1100,24 +1514,21 @@ void Chat::DrawBorder(MDrawContext* pDC)
 		pDC->Line(a.x, a.y, b.x, b.y);
 	}
 
-	// Draw the line between the output and input
 	rect.y2 -= 2;
 	rect.y2 -= InputHeight * FontHeight;
 	pDC->Line(rect.x1, rect.y2, rect.x2, rect.y2);
 }
 
-void Chat::DrawBackground(MDrawContext* pDC, TimeType Time, int Limit, bool ShowAll)
+void Chat::DrawBackground(MDrawContext * pDC, ChatTab & tab, TimeType Time, int Limit, bool ShowAll)
 {
 	if (BackgroundColor & 0xFF000000)
 	{
 		if (!InputEnabled)
 		{
-			// Need to store this value instead of calculating it every frame
 			int Lines = -max(0, NumNewlyAddedLines - 1);
-			// i needs to be signed since it terminates on -1
-			for (int i = int(Msgs.size() - 1); Lines < Limit && i >= 0; i--)
+			for (int i = int(tab.Messages.size() - 1); Lines < Limit && i >= 0; i--)
 			{
-				auto&& cl = Msgs.at(i);
+				auto&& cl = tab.Messages.at(i);
 
 				if (cl.Time + FadeTime < Time && !ShowAll && !InputEnabled)
 					break;
@@ -1145,7 +1556,7 @@ void Chat::DrawBackground(MDrawContext* pDC, TimeType Time, int Limit, bool Show
 				}
 
 				pDC->SetColor(BackgroundColor);
-				pDC->FillRectangle(MakeMRECT(Rect));
+				//pDC->FillRectangle(MakeMRECT(Rect));
 			}
 		}
 		else
@@ -1154,7 +1565,7 @@ void Chat::DrawBackground(MDrawContext* pDC, TimeType Time, int Limit, bool Show
 			Rect.y2 += (InputHeight - 1) * FontHeight;
 
 			pDC->SetColor(BackgroundColor);
-			pDC->FillRectangle(MakeMRECT(Rect));
+			//pDC->FillRectangle(MakeMRECT(Rect));
 		}
 	}
 }
@@ -1162,6 +1573,7 @@ void Chat::DrawBackground(MDrawContext* pDC, TimeType Time, int Limit, bool Show
 template <typename T>
 struct LineDivisionState
 {
+	Chat* pChat; // ADDED
 	T&& OutputIterator;
 	LineSegmentInfo CurLineSegmentInfo;
 	int ChatMessageIndex = 0;
@@ -1171,7 +1583,9 @@ struct LineDivisionState
 	u32 CurTextColor;
 	u32 CurEmphasis = EmphasisType::Default;
 
-	LineDivisionState(T&& OutputIterator, int ChatMessageIndex, u32 CurTextColor) :
+
+	LineDivisionState(Chat* pChat, T&& OutputIterator, int ChatMessageIndex, u32 CurTextColor) :
+		pChat{ pChat },
 		OutputIterator{ std::forward<T>(OutputIterator) },
 		ChatMessageIndex{ ChatMessageIndex },
 		CurTextColor{ CurTextColor }
@@ -1179,12 +1593,10 @@ struct LineDivisionState
 
 	void AddSegment(bool IsEndOfLine)
 	{
-		// Compute the length from the distance from the current character index
-		// to the one the substring started at.
 		CurLineSegmentInfo.LengthInCharacters = MsgIndex - int(CurLineSegmentInfo.Offset);
-
-		// Add this LineSegmentInfo to the vector.
-		OutputIterator++ = CurLineSegmentInfo;
+		if (CurLineSegmentInfo.LengthInCharacters > 0) {
+			OutputIterator++ = CurLineSegmentInfo;
+		}
 
 		if (IsEndOfLine)
 		{
@@ -1192,9 +1604,7 @@ struct LineDivisionState
 			Lines++;
 		}
 
-		// Reset to zero-initialized LineSegmentInfo.
 		CurLineSegmentInfo = LineSegmentInfo{};
-		// Set data.
 		CurLineSegmentInfo.ChatMessageIndex = ChatMessageIndex;
 		CurLineSegmentInfo.Offset = MsgIndex;
 		CurLineSegmentInfo.PixelOffsetX = CurrentLinePixelLength;
@@ -1202,6 +1612,7 @@ struct LineDivisionState
 		CurLineSegmentInfo.TextColor = CurTextColor;
 		CurLineSegmentInfo.Emphasis = CurEmphasis;
 	}
+
 
 	void HandleFormatSpecifier(FormatSpecifier& FormatSpec)
 	{
@@ -1237,9 +1648,6 @@ struct LineDivisionState
 
 		if (MsgIndex - int(CurLineSegmentInfo.Offset) == 0)
 		{
-			// If MsgIndex - int(CurLineSegmentInfo.Offset) equals zero,
-			// the substring would be empty if we were to add a line.
-			// Instead, we want to add the modified text attributes to the current segment.
 			CurLineSegmentInfo.TextColor = CurTextColor;
 			CurLineSegmentInfo.Emphasis = CurEmphasis;
 		}
@@ -1251,17 +1659,15 @@ struct LineDivisionState
 };
 
 template <typename T>
-void Chat::DivideIntoLines(int ChatMessageIndex, T&& OutputIterator)
+void Chat::DivideIntoLines(ChatTab & tab, int ChatMessageIndex, T && OutputIterator)
 {
-	auto&& cl = Msgs[ChatMessageIndex];
-	// Clear the previous wrapping line breaks, since we're going to add new ones.
+	auto&& cl = tab.Messages[ChatMessageIndex];
 	cl.ClearWrappingLineBreaks();
 
 	auto MaxLineLength = (Border.x2 - 5) - (Border.x1 + 5);
 
-	LineDivisionState<T> State{ std::forward<T>(OutputIterator), ChatMessageIndex, cl.DefaultColor };
+	LineDivisionState<T> State{ this, std::forward<T>(OutputIterator), ChatMessageIndex, cl.DefaultColor };
 
-	// Initialize the first segment.
 	State.CurLineSegmentInfo.ChatMessageIndex = ChatMessageIndex;
 	State.CurLineSegmentInfo.Offset = 0;
 	State.CurLineSegmentInfo.PixelOffsetX = 0;
@@ -1270,26 +1676,59 @@ void Chat::DivideIntoLines(int ChatMessageIndex, T&& OutputIterator)
 	State.CurLineSegmentInfo.Emphasis = EmphasisType::Default;
 
 	auto FormatIterator = cl.FormatSpecifiers.begin();
-	for (State.MsgIndex = 0; State.MsgIndex < int(cl.Msg.length()); ++State.MsgIndex)
+	for (State.MsgIndex = 0; State.MsgIndex < int(cl.ProcessedMsg.length()); ++State.MsgIndex)
 	{
-		// Process all the format specifiers at this index.
-		// There may be more than one, so we do a loop.
+		bool bHandledAsObject = false;
+
 		while (FormatIterator != cl.FormatSpecifiers.end() &&
 			FormatIterator->nStartPos == State.MsgIndex)
 		{
-			State.HandleFormatSpecifier(*FormatIterator);
+			if (FormatIterator->ft == FormatSpecifierType::Emoji) {
+				State.AddSegment(false);
+
+				auto it = m_EmojiMap.find(FormatIterator->EmojiName);
+				if (it != m_EmojiMap.end()) {
+					MBitmap* pBitmap = it->second;
+					int EmojiHeight = FontHeight;
+					int EmojiWidth = pBitmap->GetWidth() * (static_cast<float>(EmojiHeight) / pBitmap->GetHeight());
+
+					if (State.CurrentLinePixelLength != 0 && State.CurrentLinePixelLength + EmojiWidth > MaxLineLength) {
+						State.CurrentLinePixelLength = 0;
+						State.Lines++;
+					}
+
+					LineSegmentInfo EmojiSegment{};
+					EmojiSegment.Type = LineSegmentInfo::SegmentType::Emoji;
+					EmojiSegment.pEmojiBitmap = pBitmap;
+					EmojiSegment.ChatMessageIndex = ChatMessageIndex;
+					EmojiSegment.Offset = State.MsgIndex;
+					EmojiSegment.LengthInCharacters = 1;
+					EmojiSegment.PixelOffsetX = State.CurrentLinePixelLength;
+					EmojiSegment.IsStartOfLine = (State.CurrentLinePixelLength == 0);
+					State.OutputIterator++ = EmojiSegment;
+
+					State.CurrentLinePixelLength += EmojiWidth;
+
+					State.CurLineSegmentInfo.Offset = State.MsgIndex + 1;
+					State.CurLineSegmentInfo.PixelOffsetX = State.CurrentLinePixelLength;
+				}
+
+				bHandledAsObject = true;
+			}
+			else {
+				State.HandleFormatSpecifier(*FormatIterator);
+			}
 			++FormatIterator;
 		}
 
-		auto CharWidth = DefaultFont.GetWidth(cl.Msg.data() + State.MsgIndex, 1);
+		if (bHandledAsObject) {
+			continue;
+		}
 
-		// If adding this character would make the line length exceed the max,
-		// we add a new line for this character to go on.
+		auto CharWidth = DefaultFont.GetWidth(cl.ProcessedMsg.data() + State.MsgIndex, 1);
+
 		if (State.CurrentLinePixelLength + CharWidth > MaxLineLength)
 		{
-			// ChatMessage::AddWrappingLineBreak returns an iterator to the line break
-			// that was inserted, so we want to set FormatIterator to the next one.
-			// We do this since the current iterator may have been invalidated by the mutation.
 			FormatIterator = std::next(cl.AddWrappingLineBreak(State.MsgIndex));
 			State.AddSegment(true);
 		}
@@ -1297,11 +1736,11 @@ void Chat::DivideIntoLines(int ChatMessageIndex, T&& OutputIterator)
 		State.CurrentLinePixelLength += CharWidth;
 	}
 
-	// Add the final segment.
 	State.AddSegment(true);
 
 	cl.Lines = State.Lines;
 }
+
 
 MFontR2& Chat::GetFont(u32 Emphasis)
 {
@@ -1311,7 +1750,7 @@ MFontR2& Chat::GetFont(u32 Emphasis)
 	return DefaultFont;
 }
 
-static auto GetDrawLinesRect(const D3DRECT& OutputRect, int LinesDrawn,
+static auto GetDrawLinesRect(const D3DRECT & OutputRect, int LinesDrawn,
 	v2i PixelOffset, int FontHeight)
 {
 	return D3DRECT{
@@ -1327,13 +1766,13 @@ static u32 ScaleAlpha(u32 Color, float MessageTime, float CurrentTime,
 {
 	auto Delta = CurrentTime - MessageTime;
 
-	auto A =  (Color & 0xFF000000) >> 24;
+	auto A = (Color & 0xFF000000) >> 24;
 	auto RGB = Color & 0x00FFFFFF;
 
 	if (Delta < BeginFadeTime)
-		return Color; // 100% alpha
+		return Color;
 	if (Delta > EndFadeTime)
-		return RGB;   // 0% alpha
+		return RGB;
 
 	auto Scale = 1 - ((Delta - BeginFadeTime) / (EndFadeTime - BeginFadeTime));
 	auto AS = static_cast<u8>(A * Scale);
@@ -1341,7 +1780,7 @@ static u32 ScaleAlpha(u32 Color, float MessageTime, float CurrentTime,
 	return (AS << 24) | RGB;
 }
 
-void Chat::DrawChatLines(MDrawContext* pDC, TimeType Time, int Limit, bool ShowAll)
+void Chat::DrawChatLines(MDrawContext * pDC, ChatTab & tab, TimeType Time, int Limit, bool ShowAll)
 {
 	auto Reverse = [&](auto&& Container, int Offset = 0) {
 		return MakeRange(Container.rbegin() + Offset, Container.rend());
@@ -1363,24 +1802,42 @@ void Chat::DrawChatLines(MDrawContext* pDC, TimeType Time, int Limit, bool ShowA
 	auto MessagesOffset = max(0, NumNewlyAddedLines - 1);
 
 	int LinesDrawn = 0;
-	for (auto&& LineSegment : Reverse(LineSegments, MessagesOffset))
+	for (auto&& LineSegment : Reverse(tab.LineSegments, MessagesOffset + tab.ScrollOffsetLines))
 	{
 		v2i PixelOffset{ LineSegment.PixelOffsetX, int(ChatLinesPixelOffsetY) };
 		auto&& Rect = GetDrawLinesRect(GetOutputRect(), LinesDrawn, PixelOffset, FontHeight);
-		auto&& cl = Msgs[LineSegment.ChatMessageIndex];
+		auto&& cl = tab.Messages[LineSegment.ChatMessageIndex];
 
 		if (!ShowAll && !InputEnabled && Time > cl.Time + FadeTime)
 			break;
 
-		auto String = cl.Msg.data() + LineSegment.Offset;
-		auto Length = LineSegment.LengthInCharacters;
-		auto&& Font = GetFont(LineSegment.Emphasis);
-		auto Color = LineSegment.TextColor;
+		if (LineSegment.Type == LineSegmentInfo::SegmentType::Emoji && LineSegment.pEmojiBitmap)
+		{
+			MBitmap* pBitmap = LineSegment.pEmojiBitmap;
+			int EmojiHeight = FontHeight;
+			int EmojiWidth = pBitmap->GetWidth() * (static_cast<float>(EmojiHeight) / pBitmap->GetHeight());
 
-		if (!ShowAll && !InputEnabled)
-			Color = ScaleAlpha(Color, cl.Time, Time, FadeTime * 0.8f, FadeTime);
+			int x = Rect.x1;
+			int y = Rect.y1 + (FontHeight - EmojiHeight) / 2;
 
-		DrawTextN(Font, { String, Length }, Rect, Color);
+			auto Color = ScaleAlpha(0xFFFFFFFF, cl.Time, Time, FadeTime * 0.8f, FadeTime);
+			pDC->SetBitmap(pBitmap);
+			pDC->SetBitmapColor(Color);
+			pDC->Draw(x, y, EmojiWidth, EmojiHeight);
+			pDC->SetBitmapColor(0xFFFFFFFF);
+		}
+		else
+		{
+			auto String = cl.ProcessedMsg.data() + LineSegment.Offset;
+			auto Length = LineSegment.LengthInCharacters;
+			auto&& Font = GetFont(LineSegment.Emphasis);
+			auto Color = LineSegment.TextColor;
+
+			if (!ShowAll && !InputEnabled)
+				Color = ScaleAlpha(Color, cl.Time, Time, FadeTime * 0.8f, FadeTime);
+
+			DrawTextN(Font, { String, Length }, Rect, Color);
+		}
 
 		if (LineSegment.IsStartOfLine)
 		{
@@ -1394,16 +1851,16 @@ void Chat::DrawChatLines(MDrawContext* pDC, TimeType Time, int Limit, bool ShowA
 	DefaultFont.m_Font.EndFont();
 }
 
-void Chat::DrawSelection(MDrawContext * pDC)
+void Chat::DrawSelection(MDrawContext * pDC, ChatTab & tab)
 {
 	if (SelectionState.FromMsg && SelectionState.ToMsg)
 	{
-		auto ret = GetPos(*SelectionState.FromMsg, SelectionState.FromPos);
+		auto ret = GetPos(tab, *SelectionState.FromMsg, SelectionState.FromPos);
 		if (!ret.first)
 			return;
 		auto From = ret.second;
 
-		ret = GetPos(*SelectionState.ToMsg, SelectionState.ToPos);
+		ret = GetPos(tab, *SelectionState.ToMsg, SelectionState.ToPos);
 		if (!ret.first)
 			return;
 		auto To = ret.second;
@@ -1421,7 +1878,7 @@ void Chat::DrawSelection(MDrawContext * pDC)
 			Stuff = { SelectionState.ToMsg, SelectionState.ToPos };
 		}
 
-		ret = GetPos(*Stuff.first, Stuff.second + 1);
+		ret = GetPos(tab, *Stuff.first, Stuff.second + 1);
 		if (!ret.first)
 			return;
 		To = ret.second;
@@ -1431,10 +1888,7 @@ void Chat::DrawSelection(MDrawContext * pDC)
 		};
 
 		pDC->SetColor(SelectionColor);
-		// Get half of font, adjusted in each direction to compensate for odd font heights.
-		// For instance, if the font height is 15, we want to subtract 8 and add 7,
-		// since adjusting by a single integer value would make the rectangles we draw
-		// overlap each other slightly. (The height would be even when it ought to be odd.)
+
 		auto TopOffset = int(ceil(FontHeight / 2.f));
 		auto BottomOffset = FontHeight / 2;
 		if (From.y == To.y)
@@ -1464,9 +1918,9 @@ void Chat::DrawSelection(MDrawContext * pDC)
 	}
 }
 
+
 void Chat::DrawFrame(MDrawContext * pDC, TimeType Time)
 {
-	// Draw top of border
 	{
 		D3DRECT Rect = {
 			Border.x1,
@@ -1481,7 +1935,35 @@ void Chat::DrawFrame(MDrawContext * pDC, TimeType Time)
 
 	DrawBorder(pDC);
 
-	// Draw D button
+	{
+		const int nIconWidth = 16;
+		const int nIconHeight = 16;
+
+		const int nIconX = Border.x1 + 5;
+		const int nIconY = Border.y1 - 18;
+
+		D3DRECT LockButtonRect = {
+			nIconX,
+			nIconY,
+			nIconX + nIconWidth,
+			nIconY + nIconHeight
+		};
+
+		const char* szIconName = m_bDragAndResizeEnabled ? "btn_chk.png" : "in_key.png";
+		MBitmap* pIconBitmap = MBitmapManager::Get(szIconName);
+
+		if (pIconBitmap)
+		{
+			pDC->SetBitmap(pIconBitmap);
+			pDC->Draw(nIconX, nIconY, nIconWidth, nIconHeight);
+		}
+		else
+		{
+			const wchar_t* LockStateText = m_bDragAndResizeEnabled ? L"U" : L"L";
+			DefaultFont.m_Font.DrawText(LockButtonRect.x1, LockButtonRect.y1, LockStateText, TextColor);
+		}
+	}
+
 	{
 		D3DRECT Rect = {
 			Border.x2 - 15,
@@ -1489,8 +1971,6 @@ void Chat::DrawFrame(MDrawContext * pDC, TimeType Time)
 			Border.x2 - 15 + 12,
 			Border.y1 - 18 + FontHeight,
 		};
-
-		DrawTextN(DefaultFont, L"D", Rect, TextColor);
 	}
 
 	D3DRECT Rect = {
@@ -1503,11 +1983,9 @@ void Chat::DrawFrame(MDrawContext * pDC, TimeType Time)
 	int x = Rect.x1 + CaretCoord.x;
 	int y = Rect.y1 + (CaretCoord.y - 1) * FontHeight;
 
-	// Alternate every 0.4 seconds
 	auto Period = Seconds(0.4f);
 	if (Time % (Period * 2) > Period)
 	{
-		// Draw caret
 		pDC->SetColor(TextColor);
 		pDC->Line(x, y, x, y + FontHeight);
 	}
@@ -1515,7 +1993,46 @@ void Chat::DrawFrame(MDrawContext * pDC, TimeType Time)
 	DrawTextWordWrap(DefaultFont, InputField.c_str(), Rect, TextColor);
 }
 
-void Chat::ResetFonts(){
+void Chat::DrawScrollbar(MDrawContext * pDC, ChatTab & tab, int VisibleLines)
+{
+	if (tab.TotalLinesInHistory <= VisibleLines)
+		return;
+
+	const int ScrollbarWidth = 15;
+	auto Output = GetOutputRect();
+	D3DRECT TrackRect = {
+		Border.x2,
+		Output.y1,
+		Border.x2 + ScrollbarWidth,
+		Output.y2,
+	};
+
+	pDC->SetColor(ARGB(200, 50, 50, 50));
+	pDC->FillRectangle(MakeMRECT(TrackRect));
+
+	float TrackHeight = static_cast<float>(TrackRect.y2 - TrackRect.y1);
+	float ThumbHeight = (static_cast<float>(VisibleLines) / tab.TotalLinesInHistory) * TrackHeight;
+	ThumbHeight = max(ThumbHeight, 20.f);
+
+	float ScrollPercentage = 0;
+	if (tab.TotalLinesInHistory - VisibleLines > 0) {
+		ScrollPercentage = static_cast<float>(tab.ScrollOffsetLines) / (tab.TotalLinesInHistory - VisibleLines);
+	}
+
+	float ThumbY = TrackRect.y1 + (1.0f - ScrollPercentage) * (TrackHeight - ThumbHeight);
+
+	D3DRECT ThumbRect = {
+		TrackRect.x1,
+		static_cast<long>(ThumbY),
+		TrackRect.x2,
+		static_cast<long>(ThumbY + ThumbHeight),
+	};
+
+	pDC->SetColor(ARGB(200, 120, 120, 120));
+	pDC->FillRectangle(MakeMRECT(ThumbRect));
+}
+
+void Chat::ResetFonts() {
 	DefaultFont.Destroy();
 	ItalicFont.Destroy();
 
